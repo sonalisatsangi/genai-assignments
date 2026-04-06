@@ -1,0 +1,111 @@
+# .gitlab-ci.yml
+stages:
+  - validate
+  - test
+  - report
+  - notify
+
+# Global Variables (Override in GitLab CI/CD Settings for secrets)
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  BROWSER: "chrome"
+  HEADLESS: "true"
+  THREAD_COUNT: "3"
+  WDM_CACHE_PATH: "$CI_PROJECT_DIR/.wdm_cache"
+  # Secure Variables (Configure in GitLab -> Settings -> CI/CD -> Variables)
+  # SF_UAT_USER: "<your_admin_username>"
+  # SF_UAT_PASS: "<your_admin_password_or_app_password>"
+  # SLACK_WEBHOOK_URL: "<your_slack_incoming_webhook>"
+  # APPLITOOLS_API_KEY: "<optional_visual_testing_key>"
+
+# Cache Maven & WebDriverManager binaries across pipelines
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .m2/repository
+    - .wdm_cache
+  policy: pull-push
+
+# 1️⃣ Compile & Validate Dependencies
+validate:
+  stage: validate
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - echo "🔍 Validating framework compilation..."
+    - mvn clean compile -DskipTests
+  rules:
+    - changes:
+        - src/**/*.java
+        - pom.xml
+        - src/test/resources/testng.xml
+      when: always
+    - when: manual
+
+# 2️⃣ Execute CPQ Tests (Parallel, Headless, On-Commit/MR)
+test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  before_script:
+    - echo "🔐 Verifying secure variables..."
+    - test -n "$SF_UAT_USER" || (echo "❌ SF_UAT_USER not set" && exit 1)
+    - test -n "$SF_UAT_PASS" || (echo "❌ SF_UAT_PASS not set" && exit 1)
+    - mkdir -p target/extent-reports/screenshots
+  script:
+    - echo "🚀 Running CPQ Automation Suite (Headless: $HEADLESS | Threads: $THREAD_COUNT)"
+    - mvn test -Dbrowser=$BROWSER -Dheadless=$HEADLESS -DthreadCount=$THREAD_COUNT -Dsurefire.rerunFailingTestsCount=0
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+  artifacts:
+    when: always
+    paths:
+      - target/extent-reports/
+      - target/surefire-reports/
+      - target/failsafe-reports/
+    expire_in: 30 days
+  retry: 1 # GitLab-level retry for network/infra failures
+  timeout: 45m
+  dependencies:
+    - validate
+
+# 3️⃣ Report Generation & Archival
+report:
+  stage: report
+  image: alpine:latest
+  script:
+    - echo "📊 ExtentReports available in GitLab Artifacts"
+    - find target/extent-reports -type f -name "*.html" -exec echo "✅ {}" \;
+  rules:
+    - when: always
+  artifacts:
+    paths:
+      - target/extent-reports/
+    expire_in: 30 days
+  dependencies:
+    - test
+
+# 4️⃣ Optional Slack/Teams Notification
+notify_slack:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ "$CI_JOB_STATUS" == "success" ]; then
+        STATUS_EMOJI="✅"
+        COLOR="#36a64f"
+        MSG="Build #$CI_PIPELINE_ID completed successfully. All CPQ flows validated."
+      else
+        STATUS_EMOJI="❌"
+        COLOR="#ff0000"
+        MSG="Build #$CI_PIPELINE_ID failed. Check GitLab Artifacts for ExtentReports & logs."
+      fi
+      PAYLOAD="{\"attachments\":[{\"color\":\"$COLOR\",\"title\":\"SF-CPQ Automation ($CI_COMMIT_REF_NAME)\",\"text\":\"$STATUS_EMOJI $MSG\",\"footer\":\"Pipeline: $CI_PROJECT_NAME\",\"ts\":\"$(date +%s)\"}]}"
+      curl -s -X POST -H "Content-Type: application/json" --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+  rules:
+    - if: '$SLACK_WEBHOOK_URL != null'
+      when: always
+  allow_failure: true
+  dependencies:
+    - test
